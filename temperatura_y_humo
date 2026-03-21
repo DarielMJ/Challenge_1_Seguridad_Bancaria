@@ -1,0 +1,143 @@
+#include <DHT.h>
+
+#define DHTPIN      2
+#define DHTTYPE     DHT22
+#define MQ2_PIN     A0
+#define LED_G       9
+#define LED_Y       10
+#define LED_R       11
+#define BUZZER      8
+
+#define T_NORMAL    27.0
+#define T_AVISO     34.0
+#define T_ALERTA    49.0
+#define HUMO_UMBRAL 600    // subido de 400 a 600 para evitar falsos positivos
+
+DHT dht(DHTPIN, DHTTYPE);
+
+enum Nivel : byte { NORMAL, AVISO, ALERTA, EMERGENCIA };
+Nivel nivelAnterior = NORMAL;
+
+void apagarTodo() {
+  digitalWrite(LED_G, LOW);
+  digitalWrite(LED_Y, LOW);
+  digitalWrite(LED_R, LOW);
+  noTone(BUZZER);
+}
+
+void sirenaEmergencia() {
+  for (int f = 800; f <= 2000; f += 80) {
+    tone(BUZZER, f);
+    delay(15);
+  }
+  for (int f = 2000; f >= 800; f -= 80) {
+    tone(BUZZER, f);
+    delay(15);
+  }
+  noTone(BUZZER);
+}
+
+Nivel evaluarNivel(float t, bool humo) {
+  if (t >= 50.0 || (humo && t >= T_ALERTA)) return EMERGENCIA;
+  if (t > T_AVISO) return ALERTA;         // temperatura media sin importar humo
+  if (humo)        return ALERTA;         // humo solo también es alerta
+  if (t > T_NORMAL) return AVISO;         // leve subida de temperatura
+  return NORMAL;                          // todo bien
+}
+
+const __FlashStringHelper* nombreNivel(Nivel n) {
+  switch (n) {
+    case NORMAL:     return F("NORMAL");
+    case AVISO:      return F("AVISO");
+    case ALERTA:     return F("ALERTA");
+    case EMERGENCIA: return F("EMERGENCIA");
+    default:         return F("?");
+  }
+}
+
+void aplicarRespuesta(Nivel n) {
+  apagarTodo();
+
+  switch (n) {
+    case NORMAL:
+      digitalWrite(LED_G, HIGH);       // verde fijo = todo bien
+      break;
+
+    case AVISO:
+      digitalWrite(LED_G, HIGH);       // verde + beep suave
+      tone(BUZZER, 1000, 80);
+      break;
+
+    case ALERTA:
+      digitalWrite(LED_Y, HIGH);       // amarillo + pitido intermitente
+      tone(BUZZER, 1500, 200);
+      delay(350);
+      tone(BUZZER, 1500, 200);
+      break;
+
+    case EMERGENCIA:
+      digitalWrite(LED_R, HIGH);       // rojo + sirena
+      sirenaEmergencia();
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_Y, OUTPUT);
+  pinMode(LED_R, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  // Estado inicial: verde encendido mientras arranca
+  digitalWrite(LED_G, HIGH);
+  Serial.println(F("=== Sistema de monitoreo bancario ==="));
+  Serial.println(F("Iniciando sensores..."));
+  delay(2000);
+  digitalWrite(LED_G, LOW);
+}
+
+void loop() {
+  float t      = dht.readTemperature();
+  float h      = dht.readHumidity();
+  int humoRaw  = analogRead(MQ2_PIN);
+
+  // Validar lectura del DHT22
+  if (isnan(t) || isnan(h)) {
+    Serial.println(F("[ERROR] Fallo lectura DHT22 - verifica conexion y resistencia 10k"));
+    apagarTodo();
+    // Parpadeo rojo para indicar fallo de sensor
+    digitalWrite(LED_R, HIGH);
+    tone(BUZZER, 200, 300);
+    delay(300);
+    digitalWrite(LED_R, LOW);
+    delay(2000);
+    return;
+  }
+
+  bool humo = (humoRaw > HUMO_UMBRAL);
+  Nivel nivelActual = evaluarNivel(t, humo);
+
+  // Serial monitor - siempre muestra datos
+  Serial.print(F("T: "));
+  Serial.print(t, 1);
+  Serial.print(F("C  H: "));
+  Serial.print(h, 1);
+  Serial.print(F("%  MQ2: "));
+  Serial.print(humoRaw);
+  Serial.print(F("  Humo: "));
+  Serial.print(humo ? F("SI") : F("NO"));
+  Serial.print(F("  Nivel: "));
+  Serial.print(nombreNivel(nivelActual));
+
+  if (nivelActual != nivelAnterior) {
+    Serial.print(F("  *** CAMBIO DE NIVEL ***"));
+    nivelAnterior = nivelActual;
+  }
+  Serial.println();
+
+  aplicarRespuesta(nivelActual);
+  delay(2000);
+}
