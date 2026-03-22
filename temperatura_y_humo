@@ -1,143 +1,403 @@
+//  Vautec — Sistema de Monitoreo Bancario
+//  Team Delta · Hackathon
+//  v3 — MPU6050 integrado, bugs ISR corregidos, memoria optimizada
+
 #include <DHT.h>
+#include <Servo.h>
+#include <Wire.h>
+#include <MPU6050.h>
 
-#define DHTPIN      2
-#define DHTTYPE     DHT22
-#define MQ2_PIN     A0
-#define LED_G       9
-#define LED_Y       10
-#define LED_R       11
-#define BUZZER      8
 
-#define T_NORMAL    27.0
-#define T_AVISO     34.0
-#define T_ALERTA    49.0
-#define HUMO_UMBRAL 600    // subido de 400 a 600 para evitar falsos positivos
+#define PIN_DHT        5
+#define PIN_MQ2        A0
+#define PIN_MPU_INT    7   
+#define PIN_MOVIMIENTO 8
+#define PIN_SERVO      9
+#define PIN_LED_VERDE  10
+#define PIN_LED_AMBAR  11
+#define PIN_LED_ROJO   12
+#define PIN_BUZZER     3
+#define PIN_RESET      2
 
-DHT dht(DHTPIN, DHTTYPE);
+DHT      dht(PIN_DHT, DHT22);
+Servo    servoCompuerta;
+MPU6050  mpu;
 
-enum Nivel : byte { NORMAL, AVISO, ALERTA, EMERGENCIA };
-Nivel nivelAnterior = NORMAL;
 
-void apagarTodo() {
-  digitalWrite(LED_G, LOW);
-  digitalWrite(LED_Y, LOW);
-  digitalWrite(LED_R, LOW);
-  noTone(BUZZER);
-}
+bool accesoAutorizado  = false;
+bool horarioHabil      = false;
+bool modoMantenimiento = false;
+bool sistemaActivo     = true;
 
-void sirenaEmergencia() {
-  for (int f = 800; f <= 2000; f += 80) {
-    tone(BUZZER, f);
-    delay(15);
-  }
-  for (int f = 2000; f >= 800; f -= 80) {
-    tone(BUZZER, f);
-    delay(15);
-  }
-  noTone(BUZZER);
-}
 
-Nivel evaluarNivel(float t, bool humo) {
-  if (t >= 50.0 || (humo && t >= T_ALERTA)) return EMERGENCIA;
-  if (t > T_AVISO) return ALERTA;         // temperatura media sin importar humo
-  if (humo)        return ALERTA;         // humo solo también es alerta
-  if (t > T_NORMAL) return AVISO;         // leve subida de temperatura
-  return NORMAL;                          // todo bien
-}
+volatile bool resetPendiente = false;
 
-const __FlashStringHelper* nombreNivel(Nivel n) {
-  switch (n) {
-    case NORMAL:     return F("NORMAL");
-    case AVISO:      return F("AVISO");
-    case ALERTA:     return F("ALERTA");
-    case EMERGENCIA: return F("EMERGENCIA");
-    default:         return F("?");
-  }
-}
 
-void aplicarRespuesta(Nivel n) {
-  apagarTodo();
+const float TEMP_NORMAL_MIN = 15.0;
+const float TEMP_NORMAL_MAX = 30.0;
+const float TEMP_ALTO_MAX   = 40.0;
 
-  switch (n) {
-    case NORMAL:
-      digitalWrite(LED_G, HIGH);       // verde fijo = todo bien
-      break;
 
-    case AVISO:
-      digitalWrite(LED_G, HIGH);       // verde + beep suave
-      tone(BUZZER, 1000, 80);
-      break;
+const int HUMO_NORMAL_MAX = 300;
+const int HUMO_MEDIO_MAX  = 500;
 
-    case ALERTA:
-      digitalWrite(LED_Y, HIGH);       // amarillo + pitido intermitente
-      tone(BUZZER, 1500, 200);
-      delay(350);
-      tone(BUZZER, 1500, 200);
-      break;
 
-    case EMERGENCIA:
-      digitalWrite(LED_R, HIGH);       // rojo + sirena
-      sirenaEmergencia();
-      break;
-  }
-}
+int bufferHumo[5] = {0};
+int idxHumo       = 0;
+
+
+int fallosDHT = 0;
+
+
+const unsigned long WARMUP_MQ2 = 30000;
+
+
+float baselineAX = 0, baselineAY = 0, baselineAZ = 0;
+bool  mpuListo   = false;
+
+
+unsigned long ultimoPulso = 0;
+bool ledPulsoEncendido    = false;
+
+
+struct Evento {
+  unsigned long tiempo;
+  char          msg[40];  
+  int           score;
+};
+Evento logEventos[10];   
+int    idxLog = 0;
+
+
+void calibrarMPU();
+int  fn_temperatura();
+int  fn_humo();
+int  fn_vibracion();
+int  fn_movimiento();
+void evaluarEstadoGlobal(int score, int scoreTemp, int scoreHumo);
+void registrarEvento(const char* msg, int score);
+void imprimirDiagnostico(int sT, int sH, int sV, int sM, int total);
+void ISR_reset();
+
 
 void setup() {
   Serial.begin(9600);
+
+  pinMode(PIN_MOVIMIENTO, INPUT);
+  pinMode(PIN_LED_VERDE,  OUTPUT);
+  pinMode(PIN_LED_AMBAR,  OUTPUT);
+  pinMode(PIN_LED_ROJO,   OUTPUT);
+  pinMode(PIN_BUZZER,     OUTPUT);
+  pinMode(PIN_RESET,      INPUT_PULLUP);
+
+ 
   dht.begin();
 
-  pinMode(LED_G, OUTPUT);
-  pinMode(LED_Y, OUTPUT);
-  pinMode(LED_R, OUTPUT);
-  pinMode(BUZZER, OUTPUT);
+  
+  servoCompuerta.attach(PIN_SERVO);
+  servoCompuerta.write(0);
 
-  // Estado inicial: verde encendido mientras arranca
-  digitalWrite(LED_G, HIGH);
-  Serial.println(F("=== Sistema de monitoreo bancario ==="));
-  Serial.println(F("Iniciando sensores..."));
-  delay(2000);
-  digitalWrite(LED_G, LOW);
+ 
+  Wire.begin();
+  mpu.initialize();
+  if (mpu.testConnection()) {
+    Serial.println(F("[IMU] MPU6050 OK"));
+    calibrarMPU();
+  } else {
+    Serial.println(F("[IMU] ERROR: MPU6050 no encontrado"));
+  }
+
+
+  attachInterrupt(digitalPinToInterrupt(PIN_RESET), ISR_reset, FALLING);
+
+  digitalWrite(PIN_LED_VERDE, HIGH);
+  Serial.println(F("=== VAUTEC INICIADO ==="));
+  registrarEvento("Inicio", 0);
 }
 
-void loop() {
-  float t      = dht.readTemperature();
-  float h      = dht.readHumidity();
-  int humoRaw  = analogRead(MQ2_PIN);
 
-  // Validar lectura del DHT22
-  if (isnan(t) || isnan(h)) {
-    Serial.println(F("[ERROR] Fallo lectura DHT22 - verifica conexion y resistencia 10k"));
-    apagarTodo();
-    // Parpadeo rojo para indicar fallo de sensor
-    digitalWrite(LED_R, HIGH);
-    tone(BUZZER, 200, 300);
-    delay(300);
-    digitalWrite(LED_R, LOW);
-    delay(2000);
+void loop() {
+
+  
+  if (resetPendiente) {
+    resetPendiente = false;
+    noTone(PIN_BUZZER);
+    digitalWrite(PIN_LED_VERDE, HIGH);
+    digitalWrite(PIN_LED_AMBAR, LOW);
+    digitalWrite(PIN_LED_ROJO,  LOW);
+    servoCompuerta.write(0);
+    accesoAutorizado  = false;
+    modoMantenimiento = false;
+    ledPulsoEncendido = false;
+    Serial.println(F("[RESET] Sistema reiniciado"));
+    registrarEvento("Reset manual", 0);
+  }
+
+  if (!sistemaActivo) return;
+
+
+  int scoreTemp = fn_temperatura();
+  int scoreHumo = fn_humo();
+  int scoreVibr = fn_vibracion();
+  int scoreMov  = fn_movimiento();
+
+  
+  int scoreTotal = 0;
+  if (scoreTemp >= 0) scoreTotal += scoreTemp;
+  if (scoreHumo >= 0) scoreTotal += scoreHumo;
+  if (scoreVibr >= 0) scoreTotal += scoreVibr;
+  if (scoreMov  >= 0) scoreTotal += scoreMov;
+
+  
+  evaluarEstadoGlobal(scoreTotal, scoreTemp, scoreHumo);
+
+ 
+  static unsigned long ultimoDiag = 0;
+  if (millis() - ultimoDiag >= 5000) {
+    ultimoDiag = millis();
+    imprimirDiagnostico(scoreTemp, scoreHumo, scoreVibr, scoreMov, scoreTotal);
+  }
+
+  delay(800);
+}
+
+
+void calibrarMPU() {
+  Serial.println(F("[IMU] Calibrando baseline..."));
+  int16_t ax, ay, az, gx, gy, gz;
+  float sx = 0, sy = 0, sz = 0;
+
+  for (int i = 0; i < 100; i++) {
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    sx += ax / 16384.0;
+    sy += ay / 16384.0;
+    sz += az / 16384.0;
+    delay(10);
+  }
+
+  baselineAX = sx / 100.0;
+  baselineAY = sy / 100.0;
+  baselineAZ = sz / 100.0;
+  mpuListo   = true;
+
+  Serial.println(F("[IMU] Calibracion completa"));
+}
+
+
+int fn_temperatura() {
+  float temp = dht.readTemperature();
+
+  if (isnan(temp)) {
+    fallosDHT++;
+    if (fallosDHT > 3) {
+      Serial.println(F("[TEMP] FALLO: DHT22 no responde"));
+      registrarEvento("Fallo DHT22", -1);
+    }
+    return -1;
+  }
+  fallosDHT = 0;
+
+  if (modoMantenimiento) {
+    return (temp <= TEMP_ALTO_MAX + 5) ? 0 : 1;
+  }
+
+  if (temp >= TEMP_NORMAL_MIN && temp <= TEMP_NORMAL_MAX) return 0;
+
+  if ((temp > TEMP_NORMAL_MAX && temp <= TEMP_ALTO_MAX) ||
+      (temp < TEMP_NORMAL_MIN && temp >= 10.0)) {
+    Serial.print(F("[TEMP] Medio: ")); Serial.println(temp);
+    return 1;
+  }
+
+  Serial.print(F("[TEMP] CRITICO: ")); Serial.println(temp);
+  registrarEvento("Temp critica", 2);
+  return 2;
+}
+
+
+int fn_humo() {
+  if (millis() < WARMUP_MQ2) {
+    return -1;  
+  }
+
+  int raw = analogRead(PIN_MQ2);
+  bufferHumo[idxHumo] = raw;
+  idxHumo = (idxHumo + 1) % 5;
+
+  int filtrado = 0;
+  for (int i = 0; i < 5; i++) filtrado += bufferHumo[i];
+  filtrado /= 5;
+
+  if (modoMantenimiento) {
+    return (filtrado < HUMO_MEDIO_MAX + 100) ? 0 : 1;
+  }
+
+  if (filtrado < HUMO_NORMAL_MAX) return 0;
+
+  if (filtrado <= HUMO_MEDIO_MAX) {
+    Serial.print(F("[HUMO] Medio: ")); Serial.println(filtrado);
+    return 1;
+  }
+
+  Serial.print(F("[HUMO] CRITICO: ")); Serial.println(filtrado);
+  registrarEvento("Humo critico", 2);
+  return 2;
+}
+
+
+int fn_vibracion() {
+  if (!mpuListo) return -1;
+
+  int16_t ax, ay, az, gx, gy, gz;
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+  float acX = ax / 16384.0;
+  float acY = ay / 16384.0;
+  float acZ = az / 16384.0;
+
+  float dX = abs(acX - baselineAX);
+  float dY = abs(acY - baselineAY);
+  float dZ = abs(acZ - baselineAZ);
+
+  float mag = sqrt(dX*dX + dY*dY + dZ*dZ);
+
+  if (modoMantenimiento) {
+    return (mag < 0.8) ? 0 : 1;
+  }
+
+  if (mag < 0.05) return 0;
+
+  if (mag < 0.25) {
+    if (horarioHabil) return 0;
+    Serial.println(F("[VIBR] Leve fuera de horario"));
+    return 1;
+  }
+
+  if (mag < 0.6) {
+    Serial.print(F("[VIBR] Medio mag=")); Serial.println(mag);
+    return 1;
+  }
+
+  Serial.print(F("[VIBR] CRITICO mag=")); Serial.println(mag);
+  registrarEvento("Impacto critico", 2);
+  return 2;
+}
+
+
+int fn_movimiento() {
+  int lectura = digitalRead(PIN_MOVIMIENTO);
+
+  if (lectura == LOW) return 0;
+
+  if (accesoAutorizado) {
+    Serial.println(F("[MOV] Autorizado — OK"));
+    return 0;
+  }
+
+  if (horarioHabil) {
+    Serial.println(F("[MOV] Horario habil sin auth"));
+    return 1;
+  }
+
+  Serial.println(F("[MOV] CRITICO: Intrusion"));
+  registrarEvento("Intrusion", 2);
+  return 2;
+}
+
+
+void evaluarEstadoGlobal(int score, int scoreTemp, int scoreHumo) {
+
+  
+  digitalWrite(PIN_LED_VERDE, LOW);
+  digitalWrite(PIN_LED_AMBAR, LOW);
+  digitalWrite(PIN_LED_ROJO,  LOW);
+  noTone(PIN_BUZZER);
+
+
+  if (scoreTemp == 2 && scoreHumo == 2) {
+    servoCompuerta.write(0);
+    digitalWrite(PIN_LED_ROJO, HIGH);
+    tone(PIN_BUZZER, 2500, 800);
+    Serial.println(F("[GLOBAL] INCENDIO — COMPUERTA ABIERTA"));
+    registrarEvento("INCENDIO", score);
     return;
   }
 
-  bool humo = (humoRaw > HUMO_UMBRAL);
-  Nivel nivelActual = evaluarNivel(t, humo);
 
-  // Serial monitor - siempre muestra datos
-  Serial.print(F("T: "));
-  Serial.print(t, 1);
-  Serial.print(F("C  H: "));
-  Serial.print(h, 1);
-  Serial.print(F("%  MQ2: "));
-  Serial.print(humoRaw);
-  Serial.print(F("  Humo: "));
-  Serial.print(humo ? F("SI") : F("NO"));
-  Serial.print(F("  Nivel: "));
-  Serial.print(nombreNivel(nivelActual));
-
-  if (nivelActual != nivelAnterior) {
-    Serial.print(F("  *** CAMBIO DE NIVEL ***"));
-    nivelAnterior = nivelActual;
+  if (scoreTemp == 2 && scoreHumo != 2) {
+    servoCompuerta.write(90);
+    digitalWrite(PIN_LED_ROJO, HIGH);
+    tone(PIN_BUZZER, 1800, 600);
+    Serial.println(F("[GLOBAL] Temp alta sin humo — investigar"));
+    return;
   }
-  Serial.println();
 
-  aplicarRespuesta(nivelActual);
-  delay(2000);
+
+  if (score == 0) {
+    digitalWrite(PIN_LED_VERDE, HIGH);
+    servoCompuerta.write(0);
+
+  } else if (score <= 2) {
+    digitalWrite(PIN_LED_AMBAR, HIGH);
+    servoCompuerta.write(45);
+    tone(PIN_BUZZER, 1000, 300);
+    Serial.println(F("[GLOBAL] MEDIO"));
+
+  } else if (score <= 5) {
+    digitalWrite(PIN_LED_ROJO, HIGH);
+    servoCompuerta.write(90);
+    tone(PIN_BUZZER, 1500, 400);
+    Serial.println(F("[GLOBAL] ALTO"));
+    registrarEvento("Estado ALTO", score);
+
+  } else {
+    
+    servoCompuerta.write(180);
+    if (millis() - ultimoPulso >= 300) {
+      ultimoPulso = millis();
+      ledPulsoEncendido = !ledPulsoEncendido;
+      digitalWrite(PIN_LED_ROJO, ledPulsoEncendido);
+      if (ledPulsoEncendido) tone(PIN_BUZZER, 2000, 250);
+    }
+    Serial.println(F("[GLOBAL] CRITICO"));
+    registrarEvento("CRITICO", score);
+  }
+}
+
+
+void registrarEvento(const char* msg, int score) {
+  logEventos[idxLog].tiempo = millis() / 1000;
+  strncpy(logEventos[idxLog].msg, msg, 39);
+  logEventos[idxLog].msg[39] = '\0';
+  logEventos[idxLog].score   = score;
+  idxLog = (idxLog + 1) % 10;
+}
+
+
+void ISR_reset() {
+  resetPendiente = true;
+}
+
+
+
+void imprimirDiagnostico(int sT, int sH, int sV, int sM, int total) {
+  Serial.println(F("\n--- VAUTEC DIAGNOSTICO ---"));
+  Serial.print(F("T:")); Serial.print(sT);
+  Serial.print(F(" H:")); Serial.print(sH);
+  Serial.print(F(" V:")); Serial.print(sV);
+  Serial.print(F(" M:")); Serial.print(sM);
+  Serial.print(F(" | Score:")); Serial.println(total);
+  Serial.print(F("Auth:")); Serial.print(accesoAutorizado ? F("SI") : F("NO"));
+  Serial.print(F(" Horario:")); Serial.print(horarioHabil ? F("SI") : F("NO"));
+  Serial.print(F(" Mant:")); Serial.println(modoMantenimiento ? F("SI") : F("NO"));
+  Serial.println(F("Eventos:"));
+  for (int i = 0; i < 5; i++) {
+    if (logEventos[i].tiempo > 0) {
+      Serial.print(F("  ["));
+      Serial.print(logEventos[i].tiempo);
+      Serial.print(F("s] "));
+      Serial.println(logEventos[i].msg);
+    }
+  }
+  Serial.println(F("--------------------------\n"));
 }
